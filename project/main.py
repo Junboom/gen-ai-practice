@@ -131,16 +131,15 @@ def generate_answer(pipe, query, vectorstore, page_images_map):
     context_texts = [doc.page_content for doc in search_results]
     context = "\n".join(context_texts)
 
-    prompt = f"""
-자동차 매뉴얼 문서를 바탕으로 질문에 답해주세요. 반드시 문서 내용만 참고하세요.
-문서 내용:
-{context}
+    # 짧은 답변
+    short_prompt = f"문서를 참고하여 질문에 짧게 답변해주세요.\n문서 내용:\n{context}\n질문: {query}\n답변:"
+    output = pipe(short_prompt, max_new_tokens=200)[0]["generated_text"]
+    short_answer = output.split(short_prompt)[-1].strip()
 
-질문: {query}
-답변:
-"""
-    output = pipe(prompt, max_new_tokens=600)[0]["generated_text"]
-    answer_text = output.split(prompt)[-1].strip()
+    # 세션 요약
+    summary_prompt = f"문서를 기반으로 세션 요약을 작성해주세요.\n문서 내용:\n{context}\n요약:"
+    summary_output = pipe(summary_prompt, max_new_tokens=300)[0]["generated_text"]
+    summary_text = summary_output.split(summary_prompt)[-1].strip()
 
     # 관련 이미지
     related_images = []
@@ -149,14 +148,18 @@ def generate_answer(pipe, query, vectorstore, page_images_map):
         if page_idx is not None:
             related_images.extend(page_images_map.get(page_idx, []))
 
-    return answer_text, context_texts, related_images
+    return short_answer, summary_text, context_texts, related_images
 
 # ----------------------
 # UI
 # ----------------------
-def display_answer(ans, docs, images):
-    st.markdown("### 💬 답변")
+def display_answer(ans, summary, docs, images):
+    st.markdown("### 💬 답변 (짧게)")
     st.markdown(ans)
+
+    st.markdown("### 📝 세션 요약")
+    st.markdown(summary)
+
     st.markdown("### 📄 관련 문서 조각")
     for i, doc in enumerate(docs,1):
         st.markdown(f"{i}. {doc}")
@@ -195,8 +198,8 @@ def main():
     query = st.text_input("질문 입력")
     if st.button("질문하기") and query:
         with st.spinner("답변 생성 중..."):
-            ans, docs, images = generate_answer(llm_pipe, query, vectorstore, page_images_map)
-        display_answer(ans, docs, images)
+            ans, summary, docs, images = generate_answer(llm_pipe, query, vectorstore, page_images_map)
+        display_answer(ans, summary, docs, images)
 
 if __name__ == "__main__":
     main()
