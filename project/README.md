@@ -9,4 +9,4 @@
 5. 기름/ 차량에 필요한 소모품 충전
 
 ## Install
-1. openai, faiss-cpu, PyPDF2, pytesseract, pillow
+1. PyMuPDF

@@ -17,12 +17,6 @@ docs = [Document(page_content=text) for text in texts]
 
 embedding_model = HuggingFaceEmbeddings(model_name='sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
 
-vectorstore = Chroma.from_documents(
-    documents=docs,
-    embedding=embedding_model,
-    persist_directory='./chromaDB'
-)
-
 retriever = Chroma(
     persist_directory='./chromaDB',
     embedding_function=embedding_model
