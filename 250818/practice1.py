@@ -63,7 +63,7 @@ def replay_story(state):
         return {**state, 'response': '이전 이야기 다시 보여줌'}
     else:
         return classification(state)
-    
+
 def get_label(state):
     return state.get('label', '')
 

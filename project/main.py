@@ -13,11 +13,12 @@ from langchain.schema import Document
 from langchain.chains import RetrievalQA
 from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
 from langchain.text_splitter import CharacterTextSplitter
+from langgraph.graph import StateGraph, END
 
 # ----------------------
 # 설정
 # ----------------------
-MODEL_ID = 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'
+MODEL_ID = 'torchtorchkimtorch/Llama-3.2-Korean-GGACHI-1B-Instruct-v1'
 EMBED_MODEL_NAME = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
 
 VECTORSTORE_DIR = 'vectorstore'
@@ -28,6 +29,8 @@ CHUNK_SIZE = 512
 OVERLAP = 64
 
 PAGE_TITLE = 'Hyundai < i20 > Car Manual QA'
+
+TEMPLATE = '자동차 매뉴얼 문서를 바탕으로 질문에 답해주세요. 반드시 문서 내용만 참고하세요.\n문서 내용:\n{context}\n\n질문:\n{query}\n\n답변:\n'
 
 st.set_page_config(page_title=PAGE_TITLE, layout='wide')
 
@@ -90,20 +93,27 @@ def chunk_text(texts):
 # ----------------------
 # 벡터 스토어 구축
 # ----------------------
-def build_vectorstore(page_images_map, chunks, page_map):
-    docs = []
-    for i, chunk in enumerate(chunks):
-        docs.append(Document(page_content=chunk, metadata={'page': page_map[i]}))
+def build_vectorstore(chunks, page_map):
+    docs = [
+        Document(page_content=chunk, metadata={"page": page_map[i]})
+        for i, chunk in enumerate(chunks)
+    ]
 
     embedding_model = HuggingFaceEmbeddings(model_name=EMBED_MODEL_NAME)
+
     vectorstore = Chroma.from_documents(
         docs,
         embedding_model,
         persist_directory=VECTORSTORE_DIR
     )
 
+    retriever = Chroma(
+        persist_directory=VECTORSTORE_DIR,
+        embedding_function=embedding_model
+    ).as_retriever(search_kargs={'k': 3})
+
     st.success('Chroma Vectorstore 생성 완료')
-    return vectorstore, page_images_map
+    return vectorstore, retriever
 
 # ----------------------
 # 검색
@@ -115,7 +125,7 @@ def search_vectorstore(vectorstore, query, top_k=3):
 # ----------------------
 # LLM
 # ----------------------
-def load_retrieval_qa_chain(vectorstore):
+def load_retrieval_qa_chain(retriever):
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
 
@@ -131,55 +141,109 @@ def load_retrieval_qa_chain(vectorstore):
 
     llm = HuggingFacePipeline(pipeline=text_gen)
 
-    retriever = vectorstore.as_retriever(search_kwargs={'k': 3})
-
-    prompt = PromptTemplate.from_template(
-        '당신은 PDF를 기반으로 답변을 제공하는 AI입니다.\n\n본문:\n{context}\n\n질문:\n{question}\n\n답변:\n'
-    )
+    prompt = PromptTemplate.from_template(TEMPLATE)
 
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         retriever=retriever,
-        chain_type_kwargs={'prompt': prompt},
         return_source_documents=True
     )
 
-    return qa_chain
+    return text_gen, qa_chain
 
-def generate_answer(qa_chain, query, page_images_map):
-    result = qa_chain.invoke(query)
+def generate_long_answer(query):
+    answers = qa_chain.invoke({'query': query})
+    long_answer = answers['result'].split('답변:')[-1].strip()
 
-    short_answer = result['result'].strip()
-    source_docs = result.get('source_documents', [])
+    source_docs = answers.get('source_documents', [])
+    docs = [doc.page_content for doc in source_docs]
 
-    context_texts = [doc.page_content for doc in source_docs]
+    return long_answer, source_docs, docs
 
-    # 관련 이미지
-    related_images = []
-    for doc in source_docs:
-        page_idx = doc.metadata.get('page')
-        if page_idx is not None:
-            related_images.extend(page_images_map.get(page_idx, []))
+def generate_short_answer(text_gen, vectorstore, query):
+    output = text_gen(TEMPLATE, max_new_tokens=256)[0]['generated_text']
+    short_answer = output.split(TEMPLATE)[-1].strip()
 
-    return short_answer, context_texts, related_images
+    source_docs = search_vectorstore(vectorstore, query)
+    docs = [doc.page_content for doc in source_docs]
+
+    return short_answer, source_docs, docs
 
 # ----------------------
 # UI
 # ----------------------
-def display_answer(ans, docs, images):
-    st.markdown('### 답변')
-    st.markdown(ans)
+def display_answer(answer, docs, images):
+    with st.chat_message('assistant'):
+        st.markdown('### 답변')
+        st.markdown(answer)
 
-    st.markdown('### 관련 문서 조각')
-    for i, doc in enumerate(docs,1):
-        st.markdown(f"{i}. {doc}")
+        st.markdown('### 관련 문서 조각')
+        for i, context in enumerate(docs, 1):
+            st.markdown(f'{i}. {context}')
 
-    if images:
-        st.markdown('### 관련 이미지')
-        cols = st.columns(3)
-        for i, img_path in enumerate(images):
-            with cols[i%3]:
-                st.image(img_path, use_container_width=True)
+        if images:
+            st.markdown('### 관련 이미지')
+            cols = st.columns(3)
+            for i, img_path in enumerate(images):
+                with cols[i%3]:
+                    st.image(img_path, use_container_width=True)
+
+# ----------------------
+# langgraph
+# ----------------------
+def build_graph(vectorstore, retriever, text_gen, qa_chain):
+    def classification(state):
+        query = state.get('query', '')
+        output = text_gen(TEMPLATE, max_new_tokens=256)[0]['generated_text']
+        output_len = len(output)
+        st.markdown(f'답변 길이: {output_len}')
+        label = 'long_answer' if output_len > 256 else 'short_answer'
+        return {**state, 'label': label}
+
+    def long_answer(state):
+        with st.spinner('긴 답변 생성 중...'):
+            query = state.get('query', '')
+            answer, source_docs, docs = generate_long_answer(query)
+        return {**state, 'answer': answer, 'source_docs': source_docs, 'docs': docs}
+
+    def short_answer(state):
+        with st.spinner('짧은 답변 생성 중...'):
+            query = state.get('query', '')
+            answer, source_docs, docs = generate_short_answer(text_gen, vectorstore, query)
+        return {**state, 'answer': answer, 'source_docs': source_docs, 'docs': docs}
+
+    def ask_continue(state):
+        return {**state, 'continue': False}
+
+    def should_continue(state):
+        return 'ask_continue' if state.get('continue') else END
+
+    def get_label(state):
+        return state.get('label', '')
+
+    graph = StateGraph(dict)
+
+    graph.add_node('classification', classification)
+    graph.add_node('long_answer', long_answer)
+    graph.add_node('short_answer', short_answer)
+    graph.add_node('ask_continue', ask_continue)
+
+    graph.set_entry_point('classification')
+
+    graph.add_conditional_edges('classification', get_label, {
+        'long_answer': 'long_answer',
+        'short_answer': 'short_answer'
+    })
+
+    graph.add_edge('long_answer', 'ask_continue')
+    graph.add_edge('short_answer', 'ask_continue')
+
+    graph.add_conditional_edges('ask_continue', should_continue, {
+        'ask_continue': 'ask_continue',
+        END: END
+    })
+
+    return graph.compile()
 
 # ----------------------
 # main
@@ -199,27 +263,35 @@ def main():
     texts, page_images_map = load_pdf(pdf_path)
     chunks, page_map = chunk_text(texts)
 
-    if os.path.exists(VECTORSTORE_DIR):
-        docs = [
-            Document(page_content=chunk, metadata={"page": page_map[i]})
-            for i, chunk in enumerate(chunks)
-        ]
-        embedding_model = HuggingFaceEmbeddings(model_name=EMBED_MODEL_NAME)
-        vectorstore = Chroma.from_documents(
-            documents=docs,
-            embedding=embedding_model,
-            persist_directory=VECTORSTORE_DIR
-        )
-    else:
-        vectorstore, page_images_map = build_vectorstore(page_images_map, chunks, page_map)
+    vectorstore, retriever = build_vectorstore(chunks, page_map)
+    text_gen, qa_chain = load_retrieval_qa_chain(retriever)
+    app = build_graph(vectorstore, retriever, text_gen, qa_chain)
 
-    qa_chain = load_retrieval_qa_chain(vectorstore)
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+    for message in st.session_state.messages:
+        with st.chat_message(message['role']):
+            st.markdown(message['content'])
 
-    query = st.text_input('질문 입력')
-    if st.button('질문하기') and query:
+    query = st.chat_input('질문 입력')
+    if query:
+        st.session_state.messages.append({'role': 'user', 'content': query})
+        with st.chat_message('user'):
+            st.markdown(query)
+
         with st.spinner('답변 생성 중...'):
-            ans, docs, images = generate_answer(qa_chain, query, page_images_map)
-        display_answer(ans, docs, images)
+            results = app.invoke({'query': query})
+            answer = results['answer']
+            source_docs = results.get('source_docs', [])
+            docs = results['docs']
+            images = []
+            for doc in source_docs:
+                page_idx = doc.metadata.get('page')
+                if page_idx is not None:
+                    images.extend(page_images_map.get(page_idx, []))
+
+        st.session_state.messages.append({'role': 'assistant', 'content': answer})
+        display_answer(answer, docs, images)
 
 if __name__ == "__main__":
     main()
