@@ -23,10 +23,10 @@ EMBED_MODEL_NAME = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
 
 VECTORSTORE_DIR = 'vectorstore'
 IMAGE_DIR = 'images'
-THUMB_DIR = 'thumbnails'
 
-CHUNK_SIZE = 512
-OVERLAP = 64
+CHUNK_SIZE = 1024
+TOKEN_SIZE = 512
+OVERLAP = 128
 
 PAGE_TITLE = 'Hyundai < i20 > Car Manual QA'
 
@@ -43,7 +43,6 @@ def load_pdf(pdf_path):
     page_images_map = {}
 
     os.makedirs(IMAGE_DIR, exist_ok=True)
-    os.makedirs(THUMB_DIR, exist_ok=True)
 
     for i, page in enumerate(doc):
         page_text = page.get_text()
@@ -60,10 +59,6 @@ def load_pdf(pdf_path):
             img_path = os.path.join(IMAGE_DIR, f'page{i+1}_{img_index}.{img_ext}')
             img_obj.save(img_path)
             images.append(img_path)
-
-            thumb_path = os.path.join(THUMB_DIR, f'thumb_{i+1}_{img_index}.{img_ext}')
-            img_obj.thumbnail((200,200))
-            img_obj.save(thumb_path)
 
         page_images_map[i] = images
 
@@ -110,17 +105,10 @@ def build_vectorstore(chunks, page_map):
     retriever = Chroma(
         persist_directory=VECTORSTORE_DIR,
         embedding_function=embedding_model
-    ).as_retriever(search_kargs={'k': 3})
+    ).as_retriever(search_kwargs={'k': 3})
 
     st.success('Chroma Vectorstore 생성 완료')
     return vectorstore, retriever
-
-# ----------------------
-# 검색
-# ----------------------
-def search_vectorstore(vectorstore, query, top_k=3):
-    results = vectorstore.similarity_search(query, k=top_k)
-    return results  # list of Documents
 
 # ----------------------
 # LLM
@@ -134,14 +122,12 @@ def load_retrieval_qa_chain(retriever):
         model=model,
         tokenizer=tokenizer,
         device_map=-1,
-        max_new_tokens=512,
+        max_new_tokens=TOKEN_SIZE,
         temperature=0.2,
         top_p=0.9
     )
 
     llm = HuggingFacePipeline(pipeline=text_gen)
-
-    prompt = PromptTemplate.from_template(TEMPLATE)
 
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
@@ -151,33 +137,55 @@ def load_retrieval_qa_chain(retriever):
 
     return text_gen, qa_chain
 
-def generate_long_answer(query):
+def generate_llm_answer(query, qa_chain):
     answers = qa_chain.invoke({'query': query})
-    long_answer = answers['result'].split('답변:')[-1].strip()
-
+    long_answer = answers['result'].split('Helpful Answer:')[-1].strip()
     source_docs = answers.get('source_documents', [])
+    unique_docs = {}
+    for d in source_docs:
+        key = (d.metadata.get("source"), d.metadata.get("page"))
+        if key not in unique_docs:
+            unique_docs[key] = d
+    source_docs = list(unique_docs.values())
     docs = [doc.page_content for doc in source_docs]
-
     return long_answer, source_docs, docs
 
-def generate_short_answer(text_gen, vectorstore, query):
-    output = text_gen(TEMPLATE, max_new_tokens=256)[0]['generated_text']
-    short_answer = output.split(TEMPLATE)[-1].strip()
-
-    source_docs = search_vectorstore(vectorstore, query)
+def generate_pdf_answer(query, vectorstore, text_gen):
+    prompt = PromptTemplate.from_template(TEMPLATE)
+    source_docs = vectorstore.similarity_search(query, k=3)
+    unique_docs = {}
+    for d in source_docs:
+        key = (d.metadata.get("source"), d.metadata.get("page"))
+        if key not in unique_docs:
+            unique_docs[key] = d
+    source_docs = list(unique_docs.values())
     docs = [doc.page_content for doc in source_docs]
-
+    context = '\n'.join(docs)
+    formatted_prompt = prompt.format(context=context, query=query)
+    output = text_gen(formatted_prompt, max_new_tokens=TOKEN_SIZE)[0]['generated_text']
+    short_answer = output.split('답변:')[-1].strip()
     return short_answer, source_docs, docs
+
+def generate_summary(docs, text_gen):
+    prompt = PromptTemplate.from_template('다음 문서 내용을 바탕으로 요약해주세요.\n문서 내용:\n{context}\n\n요약:\n')
+    formatted_prompt = prompt.format(context=docs)
+    output = text_gen(formatted_prompt, max_new_tokens=TOKEN_SIZE)[0]['generated_text']
+    summary = output.split('요약:')[-1].strip()
+    return summary
 
 # ----------------------
 # UI
 # ----------------------
-def display_answer(answer, docs, images):
+def display_answer(answer, summary, docs, images):
     with st.chat_message('assistant'):
         st.markdown('### 답변')
         st.markdown(answer)
 
-        st.markdown('### 관련 문서 조각')
+        if summary:
+            st.markdown('### 요약')
+            st.markdown(summary)
+
+        st.markdown('### 관련 문서')
         for i, context in enumerate(docs, 1):
             st.markdown(f'{i}. {context}')
 
@@ -191,57 +199,62 @@ def display_answer(answer, docs, images):
 # ----------------------
 # langgraph
 # ----------------------
-def build_graph(vectorstore, retriever, text_gen, qa_chain):
-    def classification(state):
-        query = state.get('query', '')
-        output = text_gen(TEMPLATE, max_new_tokens=256)[0]['generated_text']
-        output_len = len(output)
-        st.markdown(f'답변 길이: {output_len}')
-        label = 'long_answer' if output_len > 256 else 'short_answer'
-        return {**state, 'label': label}
+def build_graph(page, vectorstore, text_gen, qa_chain):
+    def answer_method(state):
+        return {**state, 'page': page}
 
-    def long_answer(state):
-        with st.spinner('긴 답변 생성 중...'):
+    def get_page(state):
+        return state.get('page', '')
+
+    def llm_answer(state):
+        with st.spinner('LLM 답변 생성 중...'):
             query = state.get('query', '')
-            answer, source_docs, docs = generate_long_answer(query)
+            answer, source_docs, docs = generate_llm_answer(query, qa_chain)
         return {**state, 'answer': answer, 'source_docs': source_docs, 'docs': docs}
 
-    def short_answer(state):
-        with st.spinner('짧은 답변 생성 중...'):
+    def pdf_answer(state):
+        with st.spinner('ChromaDB 검색으로 답변 생성 중...'):
             query = state.get('query', '')
-            answer, source_docs, docs = generate_short_answer(text_gen, vectorstore, query)
+            answer, source_docs, docs = generate_pdf_answer(query, vectorstore, text_gen)
         return {**state, 'answer': answer, 'source_docs': source_docs, 'docs': docs}
 
-    def ask_continue(state):
-        return {**state, 'continue': False}
+    def next_step(state):
+        return {**state}
 
-    def should_continue(state):
-        return 'ask_continue' if state.get('continue') else END
+    def need_summary(state):
+        answer = state.get('answer', '')
+        answer_len = len(answer)
+        st.markdown(f'답변 길이: {answer_len}')
+        return 'get_summary' if answer_len > TOKEN_SIZE else END
 
-    def get_label(state):
-        return state.get('label', '')
+    def get_summary(state):
+        docs = state.get('docs', '')
+        summary = generate_summary(docs, text_gen)
+        return {**state, 'summary': summary}
 
     graph = StateGraph(dict)
 
-    graph.add_node('classification', classification)
-    graph.add_node('long_answer', long_answer)
-    graph.add_node('short_answer', short_answer)
-    graph.add_node('ask_continue', ask_continue)
+    graph.add_node('answer_method', answer_method)
+    graph.add_node('llm_answer', llm_answer)
+    graph.add_node('pdf_answer', pdf_answer)
+    graph.add_node('next_step', next_step)
+    graph.add_node('get_summary', get_summary)
 
-    graph.set_entry_point('classification')
-
-    graph.add_conditional_edges('classification', get_label, {
-        'long_answer': 'long_answer',
-        'short_answer': 'short_answer'
+    graph.set_entry_point('answer_method')
+    graph.add_conditional_edges('answer_method', get_page, {
+        'LLM 답변': 'llm_answer',
+        'ChromaDB 검색': 'pdf_answer'
     })
 
-    graph.add_edge('long_answer', 'ask_continue')
-    graph.add_edge('short_answer', 'ask_continue')
+    graph.add_edge('llm_answer', 'next_step')
+    graph.add_edge('pdf_answer', 'next_step')
 
-    graph.add_conditional_edges('ask_continue', should_continue, {
-        'ask_continue': 'ask_continue',
+    graph.add_conditional_edges('next_step', need_summary, {
+        'get_summary': 'get_summary',
         END: END
     })
+
+    graph.add_edge('get_summary', END)
 
     return graph.compile()
 
@@ -250,6 +263,8 @@ def build_graph(vectorstore, retriever, text_gen, qa_chain):
 # ----------------------
 def main():
     st.title(PAGE_TITLE)
+    page = st.sidebar.radio('답변 방식', ['LLM 답변', 'ChromaDB 검색'])
+    st.subheader(f'현재페이지: {page}')
 
     if len(sys.argv) < 2:
         st.error('PDF 파일 경로를 명령행 인자로 지정해주세요.\n예: streamlit run main.py data/i20.pdf')
@@ -265,7 +280,7 @@ def main():
 
     vectorstore, retriever = build_vectorstore(chunks, page_map)
     text_gen, qa_chain = load_retrieval_qa_chain(retriever)
-    app = build_graph(vectorstore, retriever, text_gen, qa_chain)
+    app = build_graph(page, vectorstore, text_gen, qa_chain)
 
     if 'messages' not in st.session_state:
         st.session_state.messages = []
@@ -282,6 +297,7 @@ def main():
         with st.spinner('답변 생성 중...'):
             results = app.invoke({'query': query})
             answer = results['answer']
+            summary = results.get('summary', '')
             source_docs = results.get('source_docs', [])
             docs = results['docs']
             images = []
@@ -290,8 +306,16 @@ def main():
                 if page_idx is not None:
                     images.extend(page_images_map.get(page_idx, []))
 
-        st.session_state.messages.append({'role': 'assistant', 'content': answer})
-        display_answer(answer, docs, images)
+        st.session_state.messages.append({
+            'role': 'assistant',
+            'content': {
+                'answer': answer,
+                'summary': summary,
+                'docs': docs,
+                'images': images
+            }
+        })
+        display_answer(answer, summary, docs, images)
 
 if __name__ == "__main__":
     main()
