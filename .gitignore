@@ -1,7 +1,6 @@
 **/chromaDB*
 
 # project
-project/image_map.txt
 project/images
-project/thumbnails
+project/lora_model
 project/vectorstore

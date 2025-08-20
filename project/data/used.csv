@@ -1,0 +1,13 @@
+items,mileage_km,mileage_month,replacement_km,relacement_month,used_percent,status
+engine_oil,4680,14,10000,12,46.8,1
+oil_filter,9150,8,10000,12,91.5,0
+air_filter,2925,3,15000,18,19.5,1
+cabin_air_filter,1095,12,15000,12,7.3,1
+front_brake_pads,30040,,40000,,75.1,1
+rear_brake_pads,53100,,60000,,88.5,0
+coolant,96960,62,80000,60,121.2,-1
+wiper_blades,,3,,12,25.0,1
+spark_plugs,13620,10,60000,48,22.7,1
+tires,19000,31,50000,48,38.0,1
+battery,,25,,48,52.1,1
+transmission_fluid,29120,45,80000,60,36.4,1
